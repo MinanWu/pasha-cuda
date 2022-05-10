@@ -1,12 +1,5 @@
 #ifndef PASHA_H
 #define PASHA_H
-
-#include <chrono>
-#include <cstring>
-#include <cuda.h>
-#include <random>
-
-
 #include <iostream>
 #include <fstream>
 #include <cmath>
@@ -20,9 +13,6 @@
 #include <cstdint>
 #include <omp.h>
 #include <limits>
-
-#include <pasha-gpu.cuh>
-
 using namespace std;
 using unsigned_int = uint64_t;
 using byte = uint8_t;
@@ -31,7 +21,6 @@ class PASHA {
         byte* finished;
         byte* pick;
         byte* used;
-        // unsigned int* locks;
         double delta;
         double epsilon;
         double* hittingNumArray;
@@ -71,9 +60,17 @@ class PASHA {
         k = argK;
         edgeNum = static_cast<unsigned_int>(pow(ALPHABET_SIZE, k));
         edgeArray = new byte[static_cast<unsigned_int>(edgeNum)];
+
+        lockArray = new byte[static_cast<unsigned_int>(edgeNum)];
+
         cout << k << ALPHABET_SIZE << edgeNum << endl;
         generateGraph(k);
         map<char, unsigned_int> alphabetMap;
+    }
+
+
+    void generateLock() {
+        for (unsigned_int i = 0; i < edgeNum; i++) edgeArray[i] = 0;
     }
 
     void generateGraph(unsigned_int k) {  
@@ -118,7 +115,9 @@ class PASHA {
         for (unsigned_int i = 0; i < ALPHABET_SIZE; i++) alphabetMap.insert(pair<char,unsigned_int>(ALPHABET[i], i));
         unsigned_int index = 0;
         for (unsigned_int j = 0; j < k; j++) {
+            //cout << alphabetMap[label[j]] << endl;
             index += alphabetMap[label[j]] * pow(4, k-j-1);
+            //cout << index << endl;
         }
         return index;
     }
@@ -164,6 +163,7 @@ class PASHA {
             }
         }
     }
+
     int depthFirstSearch(int index, unsigned_int u) {
     /**
     Depth-first search of a given index of an edge.
@@ -184,6 +184,7 @@ class PASHA {
         if (cycle) return -1;
         else return index + 1;
     }
+
     vector<unsigned_int> getAdjacent(unsigned_int v) {
     /**
     Get adjacent vertices to a given index of a vertex.
@@ -218,63 +219,91 @@ class PASHA {
         l = L-k+1;
         delta = 1/(double)l;
         epsilon = (1-8*(delta))/4;
+        //delta = 0.08333333;
+        //epsilon = 0.08333333;
         double alpha = 1 - 4*delta -2*epsilon;
         cout << "Alpha: " << 1/alpha << endl;
         cout << "Delta: " << delta << endl;
         cout << "Epsilon: " << epsilon << endl;
         unsigned_int i;
         unsigned_int j;
-        hittingNumArray = new double[(unsigned_int)edgeNum];
+        hittingNumArray = new double[(unsigned_int)edgeNum];)
         stageArray = new byte[(unsigned_int)edgeNum];
         used = new byte[vertexExp];
         finished = new byte[vertexExp];
         pick = new byte[(unsigned_int)edgeNum];
-        // locks = new unsigned int[(unsigned_int)edgeNum];
         topoSort = new int[vertexExp];
         D = new float*[l + 1];
-
         for(unsigned_int i = 0; i < l+1; i++) {D[i] = new float[vertexExp];}
         Fcurr = new float[vertexExp];
         Fprev = new float[vertexExp];
-
-
-        
         calculatePaths(l, threads);
         unsigned_int imaxHittingNum = calculateHittingNumberParallel(l, false, threads);
         cout << "Max hitting number: " << hittingNumArray[imaxHittingNum] << endl;
         h = findLog((1.0+epsilon), hittingNumArray[imaxHittingNum]);
         double prob = delta/(double)l;
-
-        pasha_gpu_init(
-            pick, 
-            alpha,
-            delta, 
-            epsilon,
-            prob,
-            hittingNumArray, 
-            edgeNum,
-            total,
-            edgeArray,
-            stageArray,
-        );
-
-
-
-        pasha_gpu_compute(
-            h
-        );
-
-        pasha_gpu_close(
-            pick
-        );
-
-        for (unsigned_int i = 0; i < edgeNum; i += 1) {
-            if (pick[i] == true) {
-                string label = getLabel(i);
-                hittingStream << label << "\n";
-                //cout << label << endl;
+        while (h > 0) {
+            //cout << h << endl;
+            total = 0;
+            unsigned_int hittingCountStage = 0;
+            double pathCountStage = 0;
+            calculatePaths(l, threads);
+            imaxHittingNum = calculateHittingNumberParallel(l, true, threads);
+            if (exit == -1) break;
+            stageVertices = pushBackVector();
+            #pragma omp parallel for num_threads(threads)
+            for (unsigned_int it = 0; it < stageVertices.size(); it++) {
+                i = stageVertices[it];
+                #pragma omp critical
+                if ((pick[i] == false) && (hittingNumArray[i] > (pow(delta, 3) * total))) {
+                    stageArray[i] = 0;
+                    pick[i] = true;
+                    hittingCountStage++;
+                    pathCountStage += hittingNumArray[i];
+                }
             }
-        }      
+            #pragma omp parallel for collapse (2) num_threads(threads) 
+            for (unsigned_int it = 0; it < stageVertices.size(); it++) {
+                for (unsigned_int jt = 0; jt < stageVertices.size(); jt++) {
+                    i = stageVertices[it];
+                    #pragma omp critical
+                    if (pick[i] == false) {
+                        if (((double) rand() / (RAND_MAX)) <= prob) {
+                            stageArray[i] = 0;
+                            pick[i] = true;
+                            hittingCountStage += 1;
+                            pathCountStage += hittingNumArray[i];
+                        }
+                        j = stageVertices[jt];
+                        if (pick[j] == false) {
+                            if (((double) rand() / (RAND_MAX)) <= prob) {
+                                stageArray[j] = 0;
+                                pick[j] = true;
+                                hittingCountStage += 1;
+                                pathCountStage += hittingNumArray[j];
+
+                            }
+                            else pick[i] = false;
+                        }
+                    }
+                }
+            }
+            hittingCount += hittingCountStage;
+            #pragma omp barrier
+            if (pathCountStage >= hittingCountStage * pow((1.0 + epsilon), h) * (1 - 4*delta - 2*epsilon)) {
+                for (unsigned_int it = 0; it < stageVertices.size(); it++) {
+                    i = stageVertices[it];
+                    if (pick[i] == true) {
+                        removeEdge(i);
+                        string label = getLabel(i);
+                        hittingStream << label << "\n";
+                        //cout << label << endl;
+                    }
+                }
+                h--;
+            }
+            else hittingCount -= hittingCountStage;
+        }
         hittingStream.close();
         topologicalSort();
         cout << "Length of longest remaining path: " <<  maxLength() << "\n";
@@ -294,7 +323,7 @@ class PASHA {
         exit = -1;
         #pragma omp parallel for num_threads(threads)
         for (unsigned_int i = 0; i < (unsigned_int)edgeNum; i++) {
-            //  calculateForEach(i, L);
+          //  calculateForEach(i, L);
             if (random == true) {
                 if (((hittingNumArray[i]) >= pow((1.0+epsilon), h-1)) && ((hittingNumArray[i]) <= pow((1.0+epsilon), h))) {
                     stageArray[i] = 1;
@@ -336,9 +365,11 @@ class PASHA {
             #pragma omp parallel for num_threads(threads)
             for (unsigned_int i = 0; i < vertexExp; i++) {
                 D[j][i] = edgeArray[i]*D[j-1][(i >> 2)] + edgeArray[i + vertexExp]*D[j-1][((i + vertexExp) >> 2)] + edgeArray[i + vertexExp2]*D[j-1][((i + vertexExp2) >> 2)] + edgeArray[i + vertexExp3]*D[j-1][((i + vertexExp3) >> 2)];
+                //cout << (float)(Dval[j][i] * pow(2, Dexp[j][i])) << endl;
+                //D[j][i] = Dval[i];
             }
-
         }
+        
         #pragma omp parallel for num_threads(threads)
         for (unsigned_int i = 0; i < (unsigned_int)edgeNum; i++) hittingNumArray[i] = 0;
         while (curr <= L) {
@@ -346,16 +377,21 @@ class PASHA {
             for (unsigned_int i = 0; i < vertexExp; i++) {
                 unsigned_int index = (i * 4);
                 Fcurr[i] = (edgeArray[index]*Fprev[index & vertexExpMask] + edgeArray[index + 1]*Fprev[(index + 1) & vertexExpMask] + edgeArray[index + 2]*Fprev[(index + 2) & vertexExpMask] + edgeArray[index + 3]*Fprev[(index + 3) & vertexExpMask]);
+            
             }
             #pragma omp parallel for num_threads(threads)
             for (unsigned_int i = 0; i < (unsigned_int)edgeNum; i++) {
+                //cout << Fprev[i % vertexExp] << " " << ((float)(Dval[(L-curr)][i / ALPHABET_SIZE] * pow(2, Dexp[(L-curr)][i / ALPHABET_SIZE]))) << endl;
                 hittingNumArray[i] += (Fprev[i % vertexExp]/1.4e-45) * (D[(L-curr)][i / ALPHABET_SIZE]/1.4e-45);
+                //cout << hittingNumArray[i] << endl;
                 if (edgeArray[i] == 0) hittingNumArray[i] = 0;
             }
             #pragma omp parallel for num_threads(threads)
             for (unsigned_int i = 0; i < vertexExp; i++) Fprev[i] = Fcurr[i];
             curr++;
+            //cout << curr << endl;
         }
+        //cout << "MaxD: " << maxD << " maxF: " << maxF << endl;
         return 1;
     }
     int findLog(double base, double x) {
@@ -366,7 +402,6 @@ class PASHA {
     */
         return (int)(log(x) / log(base));
     }
-
     vector<unsigned_int> pushBackVector() {
         vector<unsigned_int> stageVertices;
         for(unsigned_int i = 0; i < (unsigned_int)edgeNum; i++) {
@@ -374,6 +409,5 @@ class PASHA {
         }
         return stageVertices;
     }
-    
 };
 #endif
