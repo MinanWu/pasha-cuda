@@ -21,7 +21,7 @@
 #include <omp.h>
 #include <limits>
 
-#include <pasha-gpu.cuh>
+#include "pasha-gpu.cuh"
 
 using namespace std;
 using unsigned_int = uint64_t;
@@ -255,7 +255,7 @@ class PASHA {
             edgeNum,
             total,
             edgeArray,
-            stageArray,
+            stageArray
         );
 
 

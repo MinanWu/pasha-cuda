@@ -1,11 +1,23 @@
 #include <cuda.h>
 #include <iostream>
 
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <random>
+#include <vector>
+
+#include "pasha-gpu.cuh"
+
 using namespace std;
 using unsigned_int = uint64_t;
 using byte = uint8_t;
 
 #define NUM_THREADS 256
+
+#define min(a, b) (a > b)? b: a
+#define max(a, b) (a > b)? a: b 
 
 
 __constant__ unsigned_int d_vertexExp;
@@ -17,13 +29,13 @@ double epsilon_gpu;
 
 
 unsigned_int edgeNum_gpu;
-unsigned_int edgeCount_gpu;
+unsigned int edgeCount_gpu;
 unsigned_int total_gpu;
-unsigned_int size_gpu;
-unsigned_int array_slot;
+unsigned long long int size_gpu;
+unsigned long long int array_slot;
 
-unsigned_int hittingCountStage;
-double pathCountStage;
+unsigned long long int hitting_count_stage_gpu;
+double path_count_stage_gpu;
 
 byte* pick_gpu;
 byte* edgeArray_gpu;
@@ -43,17 +55,19 @@ float* D_gpu;
 
 
 
-__global__ cuda_select_vertex_wise(        
+__global__ void cuda_select_vertex_wise(        
         byte* pick_gpu,
         byte* edgeArray_gpu,
         byte* stageArray_gpu,
         double* hittingNumArray_gpu,
         unsigned_int* stageVertices_gpu,
         unsigned int* locks,
-        int size，
+        unsigned_int size,
         double delta,
-        double prob,
-        int total
+        double prob_gpu,
+        int total,
+        unsigned long long int hitting_count_stage_gpu,
+        double path_count_stage_gpu
     ) {
     unsigned int thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
     if (thread_id >= size) {
@@ -66,10 +80,10 @@ __global__ cuda_select_vertex_wise(
     while (!leaveLoop) {
         if (atomicExch(&locks[i], 1u) == 0u) {
             if ((pick_gpu[i] == false) && (hittingNumArray_gpu[i] > (pow(delta, 3) * total))) {
-                pick_gpu[i] == true;
+                pick_gpu[i] = true;
                 stageArray_gpu[i] = 0;
-                atomicAdd(&hittingCountStage, 1);
-                atomicAdd(&pathCountStage, hittingNumArray_gpu[i]); 
+                atomicAdd(&hitting_count_stage_gpu, 1);
+                atomicAdd(&path_count_stage_gpu, hittingNumArray_gpu[i]); 
                 atomicExch(&locks[i], 0u);
                 return;
             } else {
@@ -81,30 +95,32 @@ __global__ cuda_select_vertex_wise(
 }
 
 
-__global__ cuda_select_pair_wise(        
+__global__ void cuda_select_pair_wise(        
         byte* pick_gpu,
         byte* edgeArray_gpu,
         byte* stageArray_gpu,
         double* hittingNumArray_gpu,
         unsigned_int* stageVertices_gpu,
         unsigned int* locks,
-        int size，
+        unsigned long long int size_gpu,
         double delta,
-        double prob,
-        int total
+        double prob_gpu,
+        int total,
+        unsigned long long int hitting_count_stage_gpu,
+        double path_count_stage_gpu
     ) {
     unsigned int thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
-    if (thread_id >= size) {
+    if (thread_id >= size_gpu) {
         return;
     }
 
     unsigned int i = stageVertices_gpu[thread_id];
     bool leaveLoop = false;
 
-    for (unsigned int jt = 0; jt < size; jt += 1) {
+    for (unsigned int jt = 0; jt < size_gpu; jt += 1) {
         j = stageVertices_gpu[jt];
-        unsigned int small_lock = std::min(i, j);
-        unsigned int large_lock = std::max(i, j);
+        unsigned int small_lock = min(i, j);
+        unsigned int large_lock = max(i, j);
         while (!leaveLoop) {
             if (i != j) {
                 if ((atomicExch(&locks[small_lock], 1u) == 0u) && (atomicExch(&locks[large_lock], 1u) == 0u)) {
@@ -112,15 +128,15 @@ __global__ cuda_select_pair_wise(
                         if (((double) rand() / (RAND_MAX)) <= prob_gpu) {
                             stageArray_gpu[i] = 0;
                             pick_gpu[i] = true;
-                            atomicAdd(&hittingCountStage, 1);
-                            atomicAdd(&pathCountStage, hittingNumArray_gpu[i]); 
+                            atomicAdd(&hitting_count_stage_gpu, 1);
+                            atomicAdd(&path_count_stage_gpu, hittingNumArray_gpu[i]); 
                         }
-                        if (pick[j] == false) {
+                        if (pick_gpu[j] == false) {
                             if (((double) rand() / (RAND_MAX)) <= prob_gpu) {
                                 stageArray_gpu[j] = 0;
                                 pick_gpu[j] = true;
-                                atomicAdd(&hittingCountStage, 1);
-                                atomicAdd(&pathCountStage, hittingNumArray_gpu[j]); 
+                                atomicAdd(&hitting_count_stage_gpu, 1);
+                                atomicAdd(&path_count_stage_gpu, hittingNumArray_gpu[j]); 
                                 atomicExch(&locks[large_lock], 0u); 
                                 atomicExch(&locks[small_lock], 0u); 
                                 return;                                 
@@ -140,13 +156,13 @@ __global__ cuda_select_pair_wise(
             } else {
                 if ((atomicExch(&locks[i], 1u) == 0u)) {
                     if (pick_gpu[i] == false) {
-                        if (((double) rand() / (RAND_MAX)) <= prob) {
-                            atomicAdd(&hittingCountStage, 1);
-                            atomicAdd(&pathCountStage, hittingNumArray_gpu[i]); 
+                        if (((double) rand() / (RAND_MAX)) <= prob_gpu) {
+                            atomicAdd(&hitting_count_stage_gpu, 1);
+                            atomicAdd(&path_count_stage_gpu, hittingNumArray_gpu[i]); 
                         }
                     } else {
                         atomicExch(&locks[i], 0u);
-                        return                          
+                        return;                       
                     }
                     leaveLoop = true;
                     atomicExch(&locks[i], 0u);                     
@@ -157,46 +173,54 @@ __global__ cuda_select_pair_wise(
     }
 }
 
-__device__ void cuda_remove_edge(unsigned_int i) {
+__device__ void cuda_remove_edge(
+    byte* edgeArray_gpu, 
+    unsigned int edgeCount_gpu,
+    unsigned_int i
+    ) {
     /**
     Removes an edge from the graph.
     @param i: Index of edge.
     */
     if (edgeArray_gpu[i] == 1) {
-        atomicSub(&edgeCount_gpu, 1);
+        atomicSub(&edgeCount_gpu, (unsigned int)1);
     }
     edgeArray_gpu[i] = 0;
 }
 
 
-__global__ cuda_update_graph(        
+__global__ void cuda_update_graph(        
         byte* pick_gpu,
         byte* edgeArray_gpu,
         byte* stageArray_gpu,
         double* hittingNumArray_gpu,
         unsigned_int* stageVertices_gpu,
         unsigned int* locks,
-        int size，
+        unsigned long long int size_gpu,
         double delta,
-        double prob,
-        int total
+        double prob_gpu,
+        int total,
+        unsigned int edgeCount_gpu,
+        unsigned_int edgeNum_gpu
     ) {
     unsigned int thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
-    if (thread_id >= size) {
+    if (thread_id >= size_gpu) {
         return;
     }
 
     unsigned int i = stageVertices_gpu[thread_id];
 
-    i = stageVertices[it];
     if (pick_gpu[i] == true) {
-        cuda_remove_edge(i);
+        cuda_remove_edge(edgeArray_gpu, edgeCount_gpu, i);
     }
 
 }
 
 __global__ void cuda_push_back_vector (
-
+    unsigned_int edgeNum_gpu,
+    byte* edgeArray_gpu,
+    unsigned long long int array_slot,
+    unsigned_int* stageVertices_gpu
 ) {
     unsigned int thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
     if (thread_id >= edgeNum_gpu) {
@@ -204,10 +228,10 @@ __global__ void cuda_push_back_vector (
     }
     if (edgeArray_gpu[thread_id] == 1) {
         while (true) {
-            unsigned_int old_slot = array_slot;
-            unsigned_int test_slot = atomicCAS(&array_slot, old_slot, old_slot-1);
+            unsigned long long int old_slot = array_slot;
+            unsigned long long int test_slot = atomicCAS(&array_slot, old_slot, old_slot-1);
             if (test_slot == old_slot) {
-                stageVertices_gpu[test_slot-1] = (unsigned_int)thread_id;
+                stageVertices_gpu[(unsigned_int)test_slot-1] = (unsigned_int)thread_id;
                 break;
             }
         }
@@ -215,7 +239,9 @@ __global__ void cuda_push_back_vector (
 }
 
 __global__ void cuda_update_size (
-
+    unsigned long long int size_gpu,
+    unsigned_int edgeNum_gpu,
+    byte* edgeArray_gpu
 ) {
     unsigned int thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
     if (thread_id >= edgeNum_gpu) {
@@ -243,11 +269,22 @@ void push_back_vector(
 
     int grid_size = std::ceil(edgeNum_gpu / thread_block_size);
 
-    cuda_update_size<<<grid_size, thread_block_size>>>();
+    cuda_update_size<<<grid_size, thread_block_size>>>(
+        size_gpu,
+        edgeNum_gpu,
+        edgeArray_gpu
+    );
+
     array_slot = size_gpu;
     cudaMalloc((void**)&stageVertices_gpu, size_gpu * sizeof(unsigned_int));
 
-    cuda_push_back_vector<<<grid_size, thread_block_size>>>();
+    cuda_push_back_vector<<<grid_size, thread_block_size>>>(
+        edgeNum_gpu,
+        edgeArray_gpu,
+        array_slot,
+        stageVertices_gpu
+    );
+
 }
 
  
@@ -266,11 +303,11 @@ void pasha_gpu_init(
     
     prob_gpu = prob;
     edgeNum_gpu = edgeNum;
-    edgeCount_gpu = edgeCount_gpu;
+    edgeCount_gpu = (unsigned int)edgeNum_gpu;
     alpha_gpu = alpha;
     delta_gpu = delta;
     epsilon_gpu = epsilon;
-    total_gpu = tatal;
+    total_gpu = total;
 
     cudaMalloc((void**)&pick_gpu, (unsigned_int)edgeNum * sizeof(byte));
     cudaMalloc((void**)&edgeArray_gpu, (unsigned_int)edgeNum * sizeof(byte));
@@ -345,7 +382,7 @@ void calcNumStartingPaths(byte* edgeArray, float* D, float* Fprev) {
     // cudaMemcpy(edgeArray_gpu, edgeArray, vertexExp*sizeof(byte), cudaMemcpyHostToDevice);
 
     int grid_size = 1 + ((vertexExp - 1) / NUM_THREADS);
-    
+
     setInitialDFprev_gpu<<<grid_size, NUM_THREADS>>>(D_gpu, Fprev_gpu); 
 
 
@@ -370,8 +407,8 @@ void pasha_gpu_compute(
     ) {
     while (h > 0) {
         total_gpu = 0;
-        hittingCountStage = 0;
-        pathCountStage = 0;
+        hitting_count_stage_gpu = 0;
+        path_count_stage_gpu = 0;
 
         calculate_path_gpu(l, threads);
 
@@ -400,10 +437,12 @@ void pasha_gpu_compute(
             hittingNumArray_gpu,
             stageVertices_gpu,
             locks,
-            size,
-            delta,
-            prob,
-            total
+            size_gpu,
+            delta_gpu,
+            prob_gpu,
+            total_gpu,
+            hitting_count_stage_gpu,
+            path_count_stage_gpu
         );
 
 
@@ -414,17 +453,19 @@ void pasha_gpu_compute(
             hittingNumArray_gpu,
             stageVertices_gpu,
             locks,
-            size,
-            delta,
-            prob,
-            total
+            size_gpu,
+            delta_gpu,
+            prob_gpu,
+            total_gpu,
+            hitting_count_stage_gpu,
+            path_count_stage_gpu
         );
 
         cudaDeviceSynchronize();
 
-        hittingCount += hittingCountStage;
+        hittingCount += hitting_count_stage_gpu;
 
-        if (pathCountStage >= hittingCountStage * pow((1.0 + epsilon), h) * (1 - 4*delta - 2*epsilon)) {
+        if (path_count_stage_gpu >= hitting_count_stage_gpu * pow((1.0 + epsilon_gpu), h) * (1 - 4*delta_gpu - 2*epsilon_gpu)) {
             cuda_update_graph<<<grid_size, thread_block_size>>>(
                 pick_gpu,
                 edgeArray_gpu,
@@ -432,15 +473,17 @@ void pasha_gpu_compute(
                 hittingNumArray_gpu,
                 stageVertices_gpu,
                 locks,
-                size,
-                delta,
-                prob,
-                total
+                size_gpu,
+                delta_gpu,
+                prob_gpu,
+                total_gpu,
+                edgeCount_gpu,
+                edgeNum_gpu
             );
             cudaDeviceSynchronize();
             h--;
         } else {
-            hittingCount -= hittingCountStage;
+            hittingCount -= hitting_count_stage_gpu;
         }
 
         cudaFree(stageVertices_gpu);

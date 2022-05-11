@@ -1,5 +1,12 @@
-#ifndef __HITTING_NUM_CUH__
-#define __HITTING_NUM_CUH__
+#include <cuda.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <vector>
 
 using unsigned_int = uint64_t;
 using byte = uint8_t;
